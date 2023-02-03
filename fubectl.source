@@ -1,16 +1,19 @@
 #fix ZSH -  perform field splitting - http://zsh.sourceforge.net/Doc/Release/Options.html
+# shellcheck disable=SC2148
 if [ -n "$ZSH_VERSION" ]
 then
     setopt SH_WORD_SPLIT
 fi
 
 function completion_wrapper() {
+    local RARG='-a'
+    [[ -n "$ZSH_VERSION" ]] && RARG='-A'
     # ex: completion_wrapper kgns 'get ns'
     [[ "$#" == 2 ]] || return 1
     local alias_name="$1"
     local alias_args="$2"
-    eval "local alias_arg_words; alias_arg_words=($alias_args)" 2>/dev/null || continue
-    read -a alias_arg_words <<< "$alias_args"
+    eval "local alias_arg_words; alias_arg_words=($alias_args)" 2>/dev/null || return
+    read $RARG alias_arg_words <<< "$alias_args"
 
     local compl_func="__start_kubectl"
 
@@ -31,52 +34,143 @@ function completion_wrapper() {
 # helper functions
 alias _inline_fzf="fzf --multi --ansi -i -1 --height=50% --reverse -0 --header-lines=1 --inline-info --border"
 alias _inline_fzf_nh="fzf --multi --ansi -i -1 --height=50% --reverse -0 --inline-info --border"
+_k8s_export() {
+	yq e 'del(.metadata.resourceVersion)' -\
+		| yq e 'del(.metadata.uid)' -\
+		| yq e 'del(.metadata.annotations."cni.projectcalico.org/podIP")' -\
+		| yq e 'del(.metadata.annotations.checksum/config)' -\
+		| yq e 'del(.metadata.creationTimestamp)' -\
+		| yq e 'del(.metadata.ownerReferences)' -\
+		| yq e 'del(.metadata.generateName)' -\
+		| yq e 'del(.metadata.selfLink)' -\
+		| yq e 'del(.status)' -\
+		| yq e 'del(.spec.nodeName) | del(.metadata.managedFields) | del(.specs.schedulerName)' -\
+		| yq e 'del(.spec.containers[]|.volumeMounts[]|select(.mountPath == "/var/run/secrets/kubernetes.io/serviceaccount"))' -\
+		| yq e 'del(.spec.containers[]|.terminationMessagePath)' -\
+		| yq e 'del(.spec.containers[]|.terminationMessagePolicy)' -\
+		| yq e 'del(.spec.containers[]|.imagePullPolicy)' -\
+		| yq e 'del(.spec.containers[]|.dnsPolicy)' -\
+		| yq e 'del(.spec.containers[]|.dnsPolicy)' -\
+		| yq e 'del(.spec.containers[]|.enableServiceLinks)' -
+}
 
-_isClusterSpaceObject() {
+		#| yq e 'del(.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration")' -\
+# [kexp] as former `--export` field removes unwanted metadata - usage: kexp RESOURCE
+function kexp(){
+	typeset -l kind
+	local kind="$1"
+	[ -z "$kind" ] && printf "kexp: missing argument.\nUsage: kexp RESOURCE\n" && return 255
+	local cmd="kubectl get $* -oyaml"
+	if [ -z "$2" ]; then
+		cmd="kget $*"
+	fi
+	if [[ "${kind}" =~ pod? ]]; then
+		local TMP_RES
+		TMP_RES=$(mktemp -t k8s-res-XXXX)
+		if [ -n "$2" ]; then
+			kubectl get "$@" -oyaml >$TMP_RES
+		else
+			kubectl get po >$TMP_RES
+		fi
+		local k8s_sa
+		k8s_sa=$(yq e '(.spec.containers[] | .volumeMounts[] | select(.mountPath == "/var/run/secrets/kubernetes.io/serviceaccount")|.name )' $TMP_RES|uniq)
+		export k8s_sa
+		cat $TMP_RES|_k8s_export \
+			| yq e 'del(.spec.volumes[]|select(.name == env(k8s_sa)))' -
+		rm -f $TMP_RES
+	else
+		$cmd |_k8s_export
+	fi
+}
+completion_wrapper kexp 'get'
+
+
+function _isClusterSpaceObject() {
   # caller is responsible for assuring non-empty "$1"
   obj="$1"
   kubectl api-resources --namespaced=false \
-        | awk '(apiidx){print substr($0, 0, apiidx),substr($0, kindidx) } (!apiidx){ apiidx=index($0, " APIGROUP");kindidx=index($0, " KIND")}' \
+        | awk '(apiidx){print substr($0, 0, apiidx),substr($0, kindidx) } (!apiidx){ apiidx=index($0, " APIVERSION");kindidx=index($0, " KIND")}' \
     | grep -iq "\<${obj}\>"
 }
+
 # [k] like g for git but 233% as effective!
 alias k="kubectl"; complete -o default -F __start_kubectl k
 
 alias kg='k get'; completion_wrapper kg 'get'
 alias kgns='k get ns'; completion_wrapper kgns 'get ns'
 alias kl='k logs'; completion_wrapper kl 'logs'
+alias kaf='k apply -f'; completion_wrapper kaf 'apply -f'
+alias kdelf='k delete -f'; completion_wrapper kdelf 'delete -f'
+alias kdel-force='k delete --grace-period=0 --force'; completion_wrapper kdelf 'delete'
 alias kd='k describe'; completion_wrapper kd 'describe'
 alias kdp='k describe po'; completion_wrapper kdp 'describe po'
 alias kds='k describe svc'; completion_wrapper kds 'describe svc'
 alias kgp='k get po'; completion_wrapper kgp 'get po'
-alias kgpy='k get po -oyaml --export'; completion_wrapper kgpy 'get po'
+alias kgpf='k get po  -ogo-template="{{range .items}}{{if eq .status.phase \"Failed\"}}{{.metadata.name}}{{\"\n\"}}{{end}}{{end}}"'
+function kgpy() { k get po -oyaml "$@"|_k8s_export; }; completion_wrapper kgpy 'get po'
 alias kgpw='k get po -owide'; completion_wrapper kgpw 'get po -owide'
 alias kgpa='kubectl get pods -A --field-selector=metadata.namespace!=kube-system -ojsonpath='"'"'{range .items[*]}{@.metadata.name}{" "}{@.metadata.namespace}{" "}{@.status.phase}{" "}{@.status.hostIP}{" "}{@.spec.nodeName}{"\n"}{end}'"'"'|column -t'
 alias kgpaw='kubectl get pods -A -owide --field-selector=metadata.namespace!=kube-system -ojsonpath='"'"'{range .items[*]}{@.metadata.name}{" "}{@.metadata.namespace}{" "}{@.status.phase}{" "}{@.status.hostIP}{" "}{@.spec.nodeName}{"\n"}{end}'"'"'|column -t'
+alias kgpawk='kubectl get pods -A -owide -ojsonpath='"'"'{range .items[*]}{@.metadata.name}{" "}{@.metadata.namespace}{" "}{@.status.phase}{" "}{@.status.hostIP}{" "}{@.spec.nodeName}{"\n"}{end}'"'"'|column -t'
 alias kgs='k get svc'; completion_wrapper kgs 'get svc'
-alias kgsy='k get svc -oyaml --export'; completion_wrapper kgsy 'get svc'
+function kgsy() { k get svc -oyaml "$@"|_k8s_export; }; completion_wrapper kgsy 'get svc'
 alias kgd='k get deploy'; completion_wrapper kgd 'get deploy'
 
-alias kgdy='k get deploy -oyaml --export'; completion_wrapper kgdy 'get deploy'
+function kgdy() { k get deploy -oyaml "$@"|_k8s_export; }; completion_wrapper kgdy 'get deploy'
+alias kgds='k get ds'; completion_wrapper kgds 'get ds'
+function kgdsy() { k get ds -oyaml "$@"|_k8s_export; }; completion_wrapper kgdsy 'get ds'
 alias kge='k get ev'; completion_wrapper kge 'get ev'
 alias kgew='k get ev -w'; completion_wrapper kgew 'get ev -w'
+alias kgewa='k get ev -w -A'
 alias kgsec='k get secret'; completion_wrapper kgsec 'get secret'
+function kgsecy() { k get secret  -oyaml "$@"|_k8s_export; }; completion_wrapper kgsec 'get secret'
+alias kgsa='k get sa'; completion_wrapper kgsa 'get sa'
 alias kexec='k exec'; completion_wrapper kexec 'exec'
 alias kgcm='k get cm'; completion_wrapper kgcm 'get cm'
+function kgcmy() { k get cm -oyaml "$@"|_k8s_export; }; completion_wrapper kgcm 'get cm'
 alias kgj='k get jobs'; completion_wrapper kgj 'get jobs'
 alias kgn='k get no'; completion_wrapper kgn 'get no'
 alias kgnw='k get no -owide'; completion_wrapper kgnw 'get no'
-alias ktn='k top no'; completion_wrapper ktn 'top no'
-alias ktp='k top po'; completion_wrapper ktp 'top po'
+alias ktn='k top no --use-protocol-buffers'; completion_wrapper ktn 'top no'
+alias ktp='k top po --use-protocol-buffers'; completion_wrapper ktp 'top po'
 #source <(kubectl completion bash | sed s/kubectl/k/g)
-alias krun='kubectl run --generator=run-pod/v1'; completion_wrapper krun 'run' 
-export _yx='-oyaml --export'
+alias krun='kubectl run --restart=Never'; completion_wrapper krun 'run'
+
+function krun-ci() {
+    # local img="${1:-us.gcr.io/i-dss-infrastructure-prod/base-slim:latest}"
+    local img
+    local cmd=/bin/sh
+    [[ -n "$1" ]] && img=$1 ||\
+        img=$(printf "DOCKER_IMAGE
+                us.gcr.io/i-dss-infrastructure-prod/base-slim
+                us.gcr.io/i-dss-infrastructure-prod/base-python:3-slim
+                us.gcr.io/i-dss-infrastructure-prod/base-python:3-build
+                us.gcr.io/i-dss-infrastructure-prod/ci-tools:v0.3.0
+                msgongora/k8s-test
+                hashicorp/terraform
+                gcr.io/cloud-builders/gcloud
+                gcr.io/cloud-builders/kubectl
+                gcr.io/cloud-builders/bazel
+                gcr.io/kaniko-project/executor:debug"|awk '{print $1}'|_inline_fzf)
+    [[ -n "$2" ]] && cmd=$2
+    echo "$img"|grep -q kaniko && cmd=/busybox/sh
+    echo "$img"|grep -Eq "gcloud|kubectl|bazel|builders/(git|go)$" && cmd=/bin/bash
+    [[ -n "$img" ]] \
+        && krun -i --rm  --tty --restart=Never --image-pull-policy=IfNotPresent shell-$RANDOM --image="$img" --command $cmd --overrides '{"spec":{"nodeSelector": {"node_pool": "intensive-pool"},"tolerations": [{"effect": "NoSchedule","key": "high-perform","operator": "Equal","value":"true"}],"serviceAccount":"devops-sa"}}'
+}
+
+# [kfinalizer] Remove finalizer from a namespace
+function kfinalizer() {
+    ns=$(kubectl get ns| _inline_fzf|awk '{print $1}')
+    kubectl get ns $ns -ojson|grep -v '"kubernetes"'|\
+        kubectl replace --raw "/api/v1/namespaces/$ns/finalize" -f -
+}
 
 # [kcontainers] List all pods and their containers
-alias kcontainers='kubectl get po -o=custom-columns=NAME:.metadata.name,CONTAINERS:.spec.containers[*].name'; completion_wrapper k8scon 'get po'
+alias kcontainers='kubectl get po -o=custom-columns="NAME:.metadata.name,CONTAINERS:.spec.containers[*].name"'; completion_wrapper kcontainers 'get po'
 
 # [kges] get sorted events
-kges() {
+function kges() {
     {
         echo $'TIME\tNAMESPACE\tTYPE\tREASON\tOBJECT\tSOURCE\tMESSAGE';
         kubectl get ev -ojson "$@" \
@@ -87,6 +181,8 @@ kges() {
 
 # [kw] kw get po,svc,md
 alias kw="watch kubectl get"; completion_wrapper kw get
+
+alias kw1="watch -n1 kubectl get"; completion_wrapper kw1 get
 
 # [ka] get all pods in namespace
 alias ka="kubectl get pods"
@@ -105,49 +201,109 @@ alias kwall="watch kubectl get pods --all-namespaces"
 #alias kp="xdg-open 'http://localhost:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/' & kubectl proxy"
 
 # [kwatch] watch resource
-kwatch() {
+function kwatch() {
     local kind="$1"
     [ -z "$kind" ] && printf "kwatch: missing argument.\nUsage: kwatch RESOURCE\n" && return 255
     if _isClusterSpaceObject "$kind" ; then
-        (printf "NAME\n";kubectl get "${kind}" --sort-by=.metadata.name -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}')| _inline_fzf | xargs watch kubectl get "${kind}"
+        (printf "NAME\n";kubectl get "${kind}" --sort-by=.metadata.name \
+          -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}') |\
+           _inline_fzf | xargs watch kubectl get "${kind}"
     else
-        (printf "NAMESPACE NAME\n";kubectl get "${kind}" -A --field-selector=metadata.namespace!=kube-system -ojsonpath='{range .items[*]}{@.metadata.namespace}{" "}{@.metadata.name}{"\n"}{end}')|column -t| _inline_fzf | xargs watch kubectl get "${kind}" -n
+        (printf "NAMESPACE NAME\n";kubectl get "${kind}" -A \
+          --field-selector=metadata.namespace!=kube-system -ojsonpath='
+          {range .items[*]}{@.metadata.namespace}{" "}{@.metadata.name}{"\n"}{end}') |\
+          column -t| _inline_fzf | xargs watch kubectl get "${kind}" -n
     fi
 }
 
 # [kcmd] create a pod and execute a cmd/image (default bash/ubuntu) usage: "kcmd cmd" or "kcmd cmd image"
-kcmd() {
+function kcmd() {
     local cmd="$1"
+    local name=shell-$RANDOM
     local image="msgongora/k8s-test:latest"
     if [ -n "$2" ]; then
         image="$2"
     fi
     local ns="$(kubectl get ns | _inline_fzf | awk '{print $1}')"
     if [ -n "$cmd" ]; then
-        kubectl run --generator=run-pod/v1 shell-$RANDOM --namespace $ns --rm -i --tty --image ${image} -- /bin/sh -c "${cmd}"
+        kubectl run $name --restart=Never --namespace $ns --rm -i --tty --image ${image} -- /bin/sh -c "${cmd}"
     else
-        kubectl run --generator=run-pod/v1 shell-$RANDOM --namespace $ns --rm -i --tty --image ${image} -- sh
+        kubectl run $name --restart=Never --namespace $ns --rm -i --tty --image ${image} -- sh
     fi
 }
 
+# [kcmd-root] create a pod and execute a cmd/image (default bash/ubuntu) usage: "kcmd cmd" or "kcmd cmd image"
+kcmd-root() {
+    local name=shell-$RANDOM
+    local node_hostname=$( (printf "NODE\n";kubectl get node --label-columns=kubernetes.io/hostname  -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}') |_inline_fzf)
+
+
+
+
+    local image="msgongora/k8s-test:latest"
+    if [ -n "$1" ]; then
+        image="$1"
+    fi
+    local ns="$( (printf "NAMESPACE\n"; kubectl get ns -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}')| _inline_fzf)"
+
+    local overrides='
+{
+    "spec": {
+        "hostPID": true,
+        "hostNetwork": true,
+        "tolerations": [
+            {
+                "operator": "Exists",
+                "effect": "NoSchedule"
+            },
+            {
+                "operator": "Exists",
+                "effect": "NoExecute"
+            }
+        ],
+        "containers": [
+            {
+                "name": "'$name'",
+                "image": "'$image'",
+                "command": [
+                    "/bin/sh"
+                ],
+                "stdin": true,
+                "stdinOnce": true,
+                "tty": true,
+                "securityContext": {
+                    "privileged": true
+                }
+            }
+        ],
+        "nodeSelector": {
+            "kubernetes.io/hostname": "'$node_hostname'"
+        }
+    }
+}
+'
+    kubectl run $name --restart=Never -n $ns --rm -it --image $image  --overrides="${overrides}"
+
+}
+
 # [kube_ctx_name] get the current context
-# kube_ctx_name() {
-#     kubectl config current-context
-# }
+kube_ctx_name() {
+    kubectl config current-context
+}
 
 # [kube_ctx_namespace] get current namespace
-# kube_ctx_namespace() {
-#     local default_ns="$(kubectl config view --minify|grep namespace: |sed 's/namespace: //g'|tr -d ' ')"
-#     default_ns="${default_ns:-default}"
-#     echo "$default_ns"
-# }
+kube_ctx_namespace() {
+    local default_ns="$(kubectl config view --minify|grep namespace: |sed 's/namespace: //g'|tr -d ' ')"
+    default_ns="${default_ns:-default}"
+    echo "$default_ns"
+}
 
 # [kget] get a resource by its YAML
 kget() {
-    if [ $# -gt 1 ]; then
-        kubectl get $@ -oyaml
-        return 0
-    fi
+    # if [ $# -gt 1 ]; then
+    #     kubectl get $@ -oyaml
+    #     return 0
+    # fi
     local kind="$1"
     [ -z "$kind" ] && printf "kget: missing argument.\nUsage: kget RESOURCE\n" && return 255
     if _isClusterSpaceObject "$kind" ; then
@@ -165,39 +321,71 @@ ked() {
       echo "ked requires resource-type (pod,deployment,...) as argument."
       return 255
     fi
-    local edit_args
-    if _isClusterSpaceObject $kind ; then
-        edit_args=( $(kubectl get "$kind" | _inline_fzf | awk '{print $1}') )
+    local arg_pair
+
+    if [ -z "$2" ]; then
+      if _isClusterSpaceObject "$kind" ; then
+        arg_pair=$( (printf "NAME\n"; kubectl get "$kind" --sort-by=.metadata.name -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}')| _inline_fzf )
+      else
+        arg_pair="-n $( (printf "NAMESPACE NAME\n";kubectl get "$kind" -A --field-selector=metadata.namespace!=kube-system -ojsonpath='{range .items[?(@.status.phase=="Running")]}{@.metadata.namespace}{" "}{@.metadata.name}{"\n"}{end}')|column -t| _inline_fzf )"
+      fi
+      kubectl edit $kind $arg_pair
     else
-        edit_args=( $(kubectl get "$kind" --all-namespaces | _inline_fzf | awk '{print "-n", $1, $2}') )
+      kubectl edit $*
     fi
-    kubectl edit "$kind" ${edit_args[*]}
+
+    # kubectl get $kind $arg_pair -ojsonpath='{.metadata.labels}'|grep -Po "map\[\K.*(?=\])"|tr ':' '='|tr ' ' '\n'
 }
+completion_wrapper ked 'edit'
 
 # [kdes] describe resource
 kdes() {
     local kind="$1"
     [ -z "$kind" ] && printf "kdes: missing argument.\nUsage: kdes RESOURCE\n" && return 255
-    if _isClusterSpaceObject "$kind" ; then
-       (printf "NAME\n"; kubectl get "$kind" --sort-by=.metadata.name -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}')| _inline_fzf | xargs kubectl describe "$kind"
+    if [ -z "$2" ]; then
+      if _isClusterSpaceObject "$kind" ; then
+         (printf "NAME\n"; kubectl get "$kind" --sort-by=.metadata.name \
+         -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}')| _inline_fzf |\
+         xargs kubectl describe "$kind"
+      else
+          (printf "NAMESPACE NAME STATUS\n";kubectl get "$kind" -A \
+          --field-selector=metadata.namespace!=kube-system \
+          -ojsonpath='{range .items[*]}{@.metadata.namespace}{" "}{@.metadata.name}{" "}{@.status.phase}{"\n"}{end}')|\
+          column -t| _inline_fzf | xargs kubectl describe "$kind" -n
+      fi
     else
-        (printf "NAMESPACE NAME STATUS\n";kubectl get "$kind" -A --field-selector=metadata.namespace!=kube-system -ojsonpath='{range .items[*]}{@.metadata.namespace}{" "}{@.metadata.name}{" "}{@.status.phase}{"\n"}{end}')|column -t| _inline_fzf | xargs kubectl describe "$kind" -n
+      kubectl describe $*
     fi
 }
+completion_wrapper kdes 'describe'
 
 # [kdel] delete resource
 kdel() {
     local kind="$1"
     [ -z "$kind" ] && printf "kdel: missing argument.\nUsage: kdel RESOURCE\n" && return 255
-    if _isClusterSpaceObject "$kind" ; then
-        (printf "NAME\n";kubectl get "$kind" --sort-by=.metadata.name -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}')| _inline_fzf | xargs -p kubectl delete "$kind"
-    else
-        (printf "NAMESPACE NAME\n";kubectl get "$kind" -A --field-selector=metadata.namespace!=kube-system -ojsonpath='{range .items[*]}{@.metadata.namespace}{" "}{@.metadata.name}{"\n"}{end}') |column -t| _inline_fzf | xargs -p kubectl delete "$kind" -n
-        
+    if [[ -z "$2" ]]; then
+      if _isClusterSpaceObject "$kind" ; then
+          (printf "NAME\n";kubectl get "$kind" --sort-by=.metadata.name \
+            -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}')| _inline_fzf |\
+            xargs -p kubectl delete "$kind"
+      elif [ "$kind" = "evicted" ]; then
+          kubectl get pods -A -o \
+              go-template='{{range .items}}{{if eq .status.phase "Failed"}}{{if eq .status.reason "Evicted"}}kubectl delete pod -n {{.metadata.namespace}} {{.metadata.name}}{{"\n"}}{{end}}{{end}}{{end}}'|\
+                  xargs -I/ sh -c "/"
+      else
+          (printf "NAMESPACE NAME\n";kubectl get "$kind" -A \
+            --field-selector=metadata.namespace!=kube-system \
+            -ojsonpath='{range .items[*]}{@.metadata.namespace}{" "}{@.metadata.name}{"\n"}{end}')\
+              |column -t| _inline_fzf | xargs -r -p kubectl delete "$kind" -n
 
-        # --sort-by=.metadata.creationTimestamp
+
+          # --sort-by=.metadata.creationTimestamp
+      fi
+    else
+      kubectl delete $kind $2
     fi
 }
+completion_wrapper kdel 'delete'
 
 # [klog] fetch log from container
 _klog_usage() {
@@ -208,6 +396,7 @@ First argument is interpreted as LINECOUNT if it matches integer syntax.
 Additional `options` are passed on (see `kubectl logs --help` for details).
 EOF
 }
+
 klog() {
     [ "$1" = "--help" ] && _klog_usage && return
     local line_count=10
@@ -218,7 +407,10 @@ klog() {
 
     local arg_pair=$(kubectl get po --all-namespaces | _inline_fzf | awk '{print $1, $2}')
     [ -z "$arg_pair" ] && printf "klog: no pods found. no logs can be shown.\n" && return
-    local containers_out=$(echo "$arg_pair" | xargs kubectl get po -o=jsonpath='{.spec.containers[*].name} {.spec.initContainers[*].name}' -n | sed 's/ $//')
+    local containers_out
+    containers_out=$(kubectl get po \
+                      -o=jsonpath='{.spec.containers[*].name} {.spec.initContainers[*].name}' \
+                      -n $arg_pair | sed 's/ $//')
     local container_choosen=$(echo "$containers_out" |  tr ' ' "\n" | _inline_fzf_nh)
     kubectl logs -n ${arg_pair} -c "${container_choosen}" --tail="${line_count}" "$@"
 }
@@ -226,40 +418,130 @@ completion_wrapper klog 'logs'
 
 # [kex] execute command in container
 kex() {
-    [ -z "$1" ] && printf "kex: missing argument(s).\nUsage: kex COMMAND [arguments]\n" && return 255
-    local arg_pair=$((printf "NAMESPACE NAME\n";kubectl get po -A --field-selector=metadata.namespace!=kube-system -ojsonpath='{range .items[?(@.status.phase=="Running")]}{@.metadata.namespace}{" "}{@.metadata.name}{"\n"}{end}')|column -t | _inline_fzf)
+    #[ -z "$1" ] && printf "kex: missing argument(s).\nUsage: kex COMMAND [arguments]\n" && return 255
+    local args="$*"
+    [[ -z "$1" ]] && args="bash"
+    local arg_pair
+    arg_pair=$( (printf "NAMESPACE NAME\n"; kubectl get po -A \
+                --field-selector=metadata.namespace!=kube-system -ojsonpath='
+                {range .items[?(@.status.phase=="Running")]}
+                  {@.metadata.namespace}{" "}{@.metadata.name}{"\n"}
+                {end}') | column -t | _inline_fzf)
     [ -z "$arg_pair" ] && printf "kex: no pods found. no execution.\n" && return
-    local containers_out=$(echo "$arg_pair" | xargs kubectl get po -o=jsonpath='{.spec.containers[*].name}' -n)
-    local container_choosen=$(echo "$containers_out" |  tr ' ' "\n" | _inline_fzf_nh)
-    kubectl exec -it -n ${arg_pair} -c "${container_choosen}" -- "$@"
+    local containers_out
+    containers_out=$(echo "$arg_pair" | xargs kubectl get po \
+      -o=jsonpath='{.spec.containers[*].name}' -n)
+    local container_choosen
+    container_choosen=$(echo "$containers_out" |  tr ' ' "\n" | _inline_fzf_nh)
+    kubectl exec -it -n ${arg_pair} -c "${container_choosen}" -- "$args"
 }
 
 # [kfor] port-forward a container port to your local machine
 kfor() {
-    local port="$1"
-    # [ -z "$port" ] && printf "kfor: missing argument.\nUsage: kfor PORT_TO_FORWARD\n" && return 255
-    local arg_pair=$((printf "NAMESPACE NAME PORT\n"; kubectl get po -A --field-selector=metadata.namespace!=kube-system -o go-template='{{range .items}}{{$name := .metadata.name}}{{$ns := .metadata.namespace}}{{range .spec.containers}}{{range .ports}}{{if eq .protocol "TCP"}}{{$ns}}{{" "}}{{$name}}{{" "}}{{.containerPort}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}')|column -t|_inline_fzf)
-    [ -z "$arg_pair" ] && printf "kfor: no pods found. no forwarding.\n" && return
-    [ -n "$port" ] && arg_pair=$(echo $arg_pair|awk -v port=$port '{print $1, $2, port":"$3}')
-    kubectl port-forward -n $arg_pair
+    local arg="$1"
+    local port="$2"
+    # [ -z "$arg" ] && printf "kfor: missing argument.\nUsage: kfor PORT_TO_FORWARD\n" && return 255
+    local arg_pair
+		FILTER='{{range .spec.containers}}
+  {{range .ports}}
+    {{if eq .protocol "TCP"}}
+      {{$ns}}{{" "}}{{$name}}{{" "}}{{.containerPort}}{{"\n"}}
+    {{end}}
+  {{end}}
+{{end}}{{end}}'
+		: "${arg:=po}"
+
+    if echo $arg | grep -qE '^[0-9]+$'; then
+      port=$arg
+			arg=po
+		elif [ "$arg" = "svc" ]; then
+    	arg=svc
+			FILTER=' {{range .spec.ports}}
+  {{if eq .protocol "TCP"}}
+    {{$ns}}{{" "}}{{$name}}{{" "}}{{.port}}{{"\n"}}
+  {{end}}
+{{end}}{{end}}'
+		elif [ "$arg" = "deploy" ]; then
+			FILTER='{{range .spec.template.spec.containers}}
+  {{range .ports}}
+    {{if eq .protocol "TCP"}}
+      {{$ns}}{{" "}}{{$name}}{{" "}}{{.containerPort}}{{"\n"}}
+    {{end}}
+  {{end}}
+{{end}}{{end}}'
+		fi
+    # shellcheck disable=SC2016
+    arg_pair=$( (printf "NAMESPACE NAME PORT\n"; kubectl get $arg -A \
+      --field-selector=metadata.namespace!=kube-system \
+      -o go-template="{{range .items}}
+          {{\$name := .metadata.name}}
+          {{\$ns := .metadata.namespace}}
+          $FILTER") | column -t | _inline_fzf)
+
+    [ -z "$arg_pair" ] && \
+			printf "kfor: no pods found. no forwarding.\n" && return 1
+    if [ -n "$port" ]; then
+			arg_pair=$( echo $arg_pair |\
+				awk -v port=$port -v res=$arg '{print $1, res"/"$2, port":"$3}')
+		else
+			arg_pair=$( echo $arg_pair |\
+				awk -v res=$arg '{print $1, res"/"$2, $3}')
+		fi
+		kubectl port-forward -n $arg_pair
 }
 
 # [klabels] get labels
 klabels() {
-    local pod="$1"
-    if [ -z "$pod" ]; then
-        local arg_pair=$((printf "NAMESPACE NAME\n";kubectl get po -A --field-selector=metadata.namespace!=kube-system -ojsonpath='{range .items[*]}{@.metadata.namespace}{" "}{@.metadata.name}{"\n"}{end}')|column -t | _inline_fzf)
+    local kind="$1"
+    local arg_pair
+    if [ -z "$kind" ]; then
+        arg_pair=$( (printf "NAMESPACE NAME\n";kubectl get po -A -ojsonpath='
+          {range .items[*]}{@.metadata.namespace}{" "}{@.metadata.name}{"\n"}{end}') |\
+          column -t | _inline_fzf)
         arg_pair="-n $arg_pair"
+        kind=po
     else
-        arg_pair=$pod
+        if _isClusterSpaceObject "$kind" ; then
+          arg_pair=$( (printf "NAME\n"; kubectl get "$kind" --sort-by=.metadata.name \
+            -ojsonpath='{range .items[*]}{@.metadata.name}{"\n"}{end}') | _inline_fzf)
+        else
+          arg_pair=$( (printf "NAMESPACE NAME STATUS\n";kubectl get "$kind" -A \
+            -ojsonpath='{range .items[*]}
+            {@.metadata.namespace}{" "}{@.metadata.name}{" "}{@.status.phase}{"\n"}
+          {end}') | column -t| _inline_fzf)
+          arg_pair="-n $arg_pair"
+        fi
     fi
-    kubectl get po $arg_pair -ojsonpath='{.metadata.labels}'|grep -Po "map\[\K.*(?=\])"|tr ':' '='|tr ' ' '\n'
+    # kubectl get $kind $arg_pair -ojsonpath='{.metadata.labels}'|grep -Po "map\[\K.*(?=\])"|tr ':' '='|tr ' ' '\n'
+    kubectl get $kind $arg_pair \
+      -ojsonpath='{.metadata.labels}'|grep -Po "{\K.*(?=})"| tr ':' '=' |tr -d \"|tr ',' '\n'
 }
 
+# [kstern] start to get pod events using stern
+kstern() {
+    local arg_pair
+    arg_pair=$( (printf "NAMESPACE NAME\n";kubectl get po -A -ojsonpath='
+                  {range .items[*]}{@.metadata.namespace}{" "}{@.metadata.name}{"\n"}{end}
+                ') | column -t | _inline_fzf)
+    ns=$(echo "$arg_pair"|awk '{print $1}')
+    #echo kubectl get po -n $arg_pair -ojsonpath='{.metadata.labels}'
+    local label=$(kubectl get po -n $arg_pair -ojsonpath='{.metadata.labels}'|\
+      grep -Po "{\K.*(?=})"| tr ':' '=' |tr -d \"|tr ',' '\n'|_inline_fzf_nh)
+    echo -n "Running stern with '-l $lab -n $ns'"
+    if [ -z "$1" ]; then
+      echo
+      stern -l $label -n $ns
+    else
+      echo " $*"
+      stern -l $label -n $ns $*
+    fi
+
+}
 # [ksearch] search for string in resources
 ksearch() {
     local search_query="$1"
-    [ -z "$search_query" ] && printf "ksearch: missing argument.\nUsage: ksearch SEARCH_QUERY\n" && return 255
+    [ -z "$search_query" ] && printf "ksearch: missing argument.\nUsage: ksearch SEARCH_QUERY\n" \
+      && return 255
     for ns in $(kubectl get --export -o=json ns | jq -r '.items[] | .metadata.name'); do
         kubectl --namespace="${ns}" get --export -o=json \
             deployment,ingress,daemonset,secrets,configmap,service,serviceaccount,statefulsets,pod,endpoints,customresourcedefinition,events,networkpolicies,persistentvolumeclaims,persistentvolumes,replicasets,replicationcontrollers,statefulsets,storageclasses | \
@@ -271,23 +553,42 @@ ksearch() {
 }
 
 # [kcl] context list
-#alias kcl='kubectl config get-contexts'
+alias kcl='kubectl config get-contexts'
+
+# [kcdel] context delete and its dependencies
+kcdel() {
+    export _ctx=$((printf "CONTEXT NAME\n"; kubectl config get-contexts -oname)|_inline_fzf)
+    export _cluster=$(yq e '.contexts[]|select(.name == env(_ctx))|.context.cluster'  \
+      ~/.kube/config)
+    local more_ctx=$(yq e '.contexts[]|select(.context.cluster == env(_cluster)).name'  \
+      ~/.kube/config|wc -l)
+    if [ $more_ctx -eq 1 ]; then
+        kubectl config delete-cluster $_cluster
+        kubectl config unset users.$(yq e '.contexts[]|select(.name == env(_ctx))|.context.user' \
+          ~/.kube/config)
+        kubectl config delete-context "${_ctx}"
+    fi
+    unset _ctx _cluster
+}
 
 # [kcs] context set
-#kcs() {
-#    local context="$(kubectl config get-contexts | _inline_fzf | cut -b4- | awk '{print $1}')"
-#    kubectl config set current-context "${context}"
-#}
+kcs() {
+   local context="$(kubectl config get-contexts --no-headers -oname| _inline_fzf | cut -b4- | \
+    awk '{print $1}')"
+   kubectl config set current-context "${context}"
+}
 
-# [kcns] context set default namespace
-# kcns() {
-#     local ns="$1"
-#     if [ -z "$ns" ]; then
-#         ns="$(kubectl get ns | _inline_fzf | awk '{print $1}')"
-#     fi
-#     [ -z "$ns" ] && printf "kcns: no namespace selected/found.\nUsage: kcns [NAMESPACE]\n" && return
-#     kubectl config set-context "$(kubectl config current-context)" --namespace="${ns}"
-# }
+# [kns] context set default namespace
+kns() {
+    local ns="$1"
+    if [ -z "$ns" ]; then
+        ns="$(kubectl get ns | _inline_fzf | awk '{print $1}')"
+    fi
+    [ -z "$ns" ] && printf "kcns: no namespace selected/found.\nUsage: kcns [NAMESPACE]\n" \
+      && return
+    kubectl config set-context "$(kubectl config current-context)" --namespace="${ns}"
+}
+completion_wrapper kns 'get ns'
 
 # [kwns] watch pods in a namespace
 kwns() {
@@ -311,14 +612,27 @@ kwns() {
 
 # [konsole] create root shell on a node
 konsole() {
-    local node_hostname="$(kubectl get node --label-columns=kubernetes.io/hostname | _inline_fzf | awk '{print $6}')"
-    local ns="$(kubectl get ns | _inline_fzf | awk '{print $1}')"
+    local node_hostname
+    node_hostname="$(kubectl get node --label-columns=kubernetes.io/hostname | _inline_fzf |\
+                      awk '{print $6}')"
+    local ns
+    ns="$(kubectl get ns | _inline_fzf | awk '{print $1}')"
     local name=shell-$RANDOM
     local overrides='
 {
     "spec": {
         "hostPID": true,
         "hostNetwork": true,
+        "tolerations": [
+            {
+                "operator": "Exists",
+                "effect": "NoSchedule"
+            },
+            {
+                "operator": "Exists",
+                "effect": "NoExecute"
+            }
+        ],
         "containers": [
             {
                 "name": "'$name'",
@@ -347,26 +661,55 @@ konsole() {
     }
 }
 '
-    kubectl run --generator=run-pod/v1 $name --namespace $ns --rm -it --image alpine --overrides="${overrides}"
+    kubectl run $name --restart=Never --namespace $ns --rm -it --image alpine \
+      --overrides="${overrides}"
+}
+# [gkegpool] list gke node-pools
+gkegpool() {
+    local project="$1"
+    [ -n "$project" ] && local ARGS="--project=$project"
+    local arg_pair
+    arg_pair=$( (printf "CLUSTER LOCATION\n"; gcloud container clusters list \
+                --format='value(name, location)' $ARGS) | column -t | _inline_fzf)
+    # [ -z "$arg_pair" ] && printf "kfor: no pods found. no forwarding.\n" && return
+    arg_pair=$(echo $arg_pair|awk \
+      'l=split($2,loc,"-") {if (l==3) {print $1, "--zone="$2} else {print $1, "--region="$2}}')
+    gcloud container node-pools list --cluster=$arg_pair --format='value(name)' $ARGS
+}
+# [gkedes] describe gke cluster/node-pool
+gkedes() {
+    local kind="pool"
+    local arg_proj=""
+    if [ $# -eq 1 ]; then
+        echo $1 |grep -q "cluster\|pool" \
+            && kind=$1 \
+            || arg_proj="--project=$1"
+    elif [ $# -eq 2 ]; then
+        if echo $1 |grep -q "cluster\|pool"; then
+            kind=$1
+            arg_proj="--project=$2"
+        else
+            kind=$2
+            arg_proj="--project=$1"
+        fi
+    fi
+    local arg_aux
+    arg_aux=$( (printf "CLUSTER LOCATION\n"; gcloud container clusters list --format='
+                value(name, location)' $arg_proj) | column -t | _inline_fzf)
+    arg_aux=$(echo $arg_aux | awk 'l=split($2,loc,"-") {
+                                  if (l==3) {print $1, "--zone="$2}
+                                  else {print $1, "--region="$2}
+                                }')
+    if [ "$kind" = "pool" ]; then
+        arg_aux="$( (printf "POOL\n"; gcloud container node-pools list --cluster=$arg_aux \
+                      --format='value(name)' $arg_proj) |_inline_fzf) --cluster=$arg_aux"
+    fi
+    test "$kind" = "pool" && kind="node-pools" || kind=clusters
+    gcloud container $kind describe $arg_aux $arg_proj --format=yaml
 }
 
-kgpool() {
-    local project="$1"
-    [ -n "$project" ] && local ARGS="--project=$project"
-    local arg_pair=$((printf "CLUSTER LOCATION\n"; gcloud container clusters list --format='value(name, location)' $ARGS)|column -t|_inline_fzf)
-    # [ -z "$arg_pair" ] && printf "kfor: no pods found. no forwarding.\n" && return
-    arg_pair=$(echo $arg_pair|awk 'l=split($2,loc,"-") {if (l==3) {print $1, "--zone="$2} else {print $1, "--region="$2}}')
-    gcloud container node-pools list --cluster=$arg_pair --format='value(name)' $ARGS 
-}
-kgdes() {
-    local project="$1"
-    [ -n "$project" ] && local ARGS="--project=$project"
-    local arg_pair=$((printf "CLUSTER LOCATION\n"; gcloud container clusters list --format='value(name, location)' $ARGS)|column -t|_inline_fzf)
-    arg_pair=$(echo $arg_pair|awk 'l=split($2,loc,"-") {if (l==3) {print $1, "--zone="$2} else {print $1, "--region="$2}}')
-    local name=$((printf "POOL\n"; gcloud container node-pools list --cluster=$arg_pair --format='value(name)' $ARGS)|_inline_fzf)
-    gcloud container node-pools describe $name --cluster=$arg_pair $ARGS --format=yaml
-}
-kgcluster() {
+# [gkecluster] gke cluster list
+gkecluster() {
     local project="$1"
      [ -n "$project" ] && local ARGS="--project=$project"
     gcloud container clusters list $ARGS
@@ -375,7 +718,7 @@ kgcluster() {
 ksec () {
     ns=$(kubectl get ns | _inline_fzf | awk '{print $1}')
     local secret=$(kubectl get secret -n "$ns" | _inline_fzf | awk '{print $1}')
-    local key=$(kubectl get secret -n "$ns" "$secret" -o json | jq -r '.data | to_entries[] | "\(.key)"' | _inline_fzf_nh)       
+    local key=$(kubectl get secret -n "$ns" "$secret" -o json | jq -r '.data | to_entries[] | "\(.key)"' | _inline_fzf_nh)
     kubectl view-secret -n "$ns" "$secret" "$key"
 }
 
@@ -406,11 +749,14 @@ khelp() {
 }
 # [htemplate] Render chart templates locally and display the output.
 htemplate() {
+# ex. htemplate jenkins/jenkins -f deploy/values-jcasc.yaml
+# ex. htemplate . -f deploy/values-jcasc.yaml
     CHART=${1}
     ARGS=${@:2}
     TMP_DIR=$(mktemp -d -t htemp-XXXX)
     helm fetch --untar --untardir ${TMP_DIR} ${CHART}
     helm template ${ARGS} ${TMP_DIR}/*
+    rm -rf $TMP_DIR
 }
 
-# ex: ts=4:sw=4:ft=sh
+# ex: et:ts=2:sw=2:ft=sh:
