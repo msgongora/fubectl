@@ -527,7 +527,7 @@ kstern() {
     #echo kubectl get po -n $arg_pair -ojsonpath='{.metadata.labels}'
     local label=$(kubectl get po -n $arg_pair -ojsonpath='{.metadata.labels}'|\
       grep -Po "{\K.*(?=})"| tr ':' '=' |tr -d \"|tr ',' '\n'|_inline_fzf_nh)
-    echo -n "Running stern with '-l $lab -n $ns'"
+    echo -n "Running stern with '-l $label -n $ns'"
     if [ -z "$1" ]; then
       echo
       stern -l $label -n $ns
