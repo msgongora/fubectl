@@ -1,0 +1,57 @@
+version: '3'
+
+vars:
+  IMAGE: k8s-test
+  REGISTRY: msgongora
+  TAG: latest
+  BUILD_ARG: ''
+  GITREV:
+    sh: git rev-parse --short HEAD
+
+tasks:
+  default:
+    silent: true
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the Docker image.
+    cmds:
+      - 'docker build -t "{{.REGISTRY}}/{{.IMAGE}}:{{.TAG}}" {{.BUILD_ARG}} .'
+
+  push:
+    desc: Build and push the Docker image to the registry.
+    cmds:
+      - task: build
+        vars:
+          TAG: '{{.TAG}}'
+      - 'docker push "{{.REGISTRY}}/{{.IMAGE}}:{{.TAG}}"'
+
+  build-git:
+    desc: Build the Docker image using the Git SHA as its tag.
+    cmds:
+      - task: build
+        vars:
+          TAG: '{{.GITREV}}'
+
+  push-git:
+    desc: Build and push the Docker image using the Git SHA as its tag.
+    cmds:
+      - task: push
+        vars:
+          TAG: '{{.GITREV}}'
+
+  clean:
+    desc: Delete the current Docker image.
+    cmds:
+      - 'docker rmi -f "{{.REGISTRY}}/{{.IMAGE}}:{{.TAG}}" 2>/dev/null || true'
+
+  img:
+    desc: Show the Docker image that will be built.
+    cmds:
+      - 'echo "{{.REGISTRY}}/{{.IMAGE}}:{{.TAG}}"'
+
+  img-git:
+    desc: Show the Docker image using the Git SHA as its tag.
+    cmds:
+      - 'echo "{{.REGISTRY}}/{{.IMAGE}}:{{.GITREV}}"'

@@ -1,3 +1,3 @@
-Makefile
+Taskfile.yaml
 boilerplate
 verify-boilerplate.sh
